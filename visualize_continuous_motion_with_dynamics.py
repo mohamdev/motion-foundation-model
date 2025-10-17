@@ -71,6 +71,17 @@ def load_features(h5_path: Path) -> np.ndarray:
         return f["data/features"][:]
 
 
+def load_labels(h5_path: Path) -> Optional[np.ndarray]:
+    """Load marker data (labels) if available."""
+    try:
+        with h5py.File(h5_path, "r") as f:
+            if "data/labels" in f:
+                return f["data/labels"][:]
+    except Exception:
+        pass
+    return None
+
+
 def index_by_subject(subjects: np.ndarray) -> Dict[int, np.ndarray]:
     d = {}
     for i, s in enumerate(subjects):
@@ -194,13 +205,20 @@ def reconstruct_continuous_motion(sequences: np.ndarray, stride: Optional[int] =
 # Visualization with dynamics
 # ===============================================================
 
-def setup_scene_with_dynamics(vis, radius: float, K: int):
+def setup_scene_with_dynamics(vis, radius: float, K: int, num_markers: int = 0):
     """Setup meshcat scene with skeleton and dynamics visualization objects."""
     # Skeleton joints
     sphere = g.Sphere(radius)
     joint_mat = g.MeshLambertMaterial(opacity=0.95, transparent=True, color=0xffffff)
     for j in range(K):
         vis[f"skeleton/joints/{j}"].set_object(sphere, joint_mat)
+
+    # Markers (smaller, light gray)
+    if num_markers > 0:
+        marker_sphere = g.Sphere(radius * 0.3)
+        marker_mat = g.MeshLambertMaterial(opacity=0.7, transparent=True, color=0xcccccc)
+        for m in range(num_markers):
+            vis[f"markers/{m}"].set_object(marker_sphere, marker_mat)
 
     # Center of mass (larger red sphere)
     com_sphere = g.Sphere(radius * 2.5)
@@ -384,7 +402,8 @@ def play_continuous_motion_with_dynamics(vis, motion: np.ndarray, dynamics: Cent
                                         fps: int, edges: List[Tuple[int, int]],
                                         reference_joint: int = midHip,
                                         momentum_scale: float = 0.1,
-                                        angular_momentum_scale: float = 1.0):
+                                        angular_momentum_scale: float = 1.0,
+                                        markers: Optional[np.ndarray] = None):
     """
     Play continuous motion with centroidal dynamics visualization.
 
@@ -402,24 +421,58 @@ def play_continuous_motion_with_dynamics(vis, motion: np.ndarray, dynamics: Cent
     dt = 1.0 / float(fps)
     line_mat = g.LineBasicMaterial(linewidth=2, color=0xaaaaaa)
 
-    # Center motion on first frame's reference joint
+    # Center skeleton on first frame's reference joint (BEFORE rotation)
     if 0 <= reference_joint < K:
-        origin = motion[0, reference_joint:reference_joint+1, :]
+        skeleton_origin = motion[0, reference_joint:reference_joint+1, :]
     else:
-        origin = motion[0].mean(axis=0, keepdims=True)
+        skeleton_origin = motion[0].mean(axis=0, keepdims=True)
 
-    motion_centered = motion - origin
+    motion_centered = motion - skeleton_origin
+
+    # Center markers on their own hip position (to align with skeleton)
+    if markers is not None:
+        # Marker indices: RHJC=41, LHJC=42 (Right/Left Hip Joint Centers)
+        # midHip for markers = average of RHJC and LHJC
+        RHJC_idx = 41
+        LHJC_idx = 42
+
+        if markers.shape[1] > LHJC_idx:  # Check if we have enough markers
+            # Calculate midHip from hip joint center markers
+            RHJC = markers[0, RHJC_idx:RHJC_idx+1, :]  # First frame, right hip
+            LHJC = markers[0, LHJC_idx:LHJC_idx+1, :]  # First frame, left hip
+            markers_origin = (RHJC + LHJC) / 2.0  # midHip
+            print(f"[info] Centering markers on midHip (avg of RHJC and LHJC)")
+        else:
+            # Fallback: use mean if we don't have RHJC/LHJC
+            markers_origin = markers[0].mean(axis=0, keepdims=True)
+            print(f"[warn] RHJC/LHJC markers not found, using mean position")
+
+        markers_centered = markers - markers_origin
+    else:
+        markers_centered = None
 
     # Compute all centroidal dynamics
     print(f"[info] Computing centroidal dynamics...")
     all_dynamics = dynamics.compute_all_dynamics(motion)
 
-    com = all_dynamics['com'] - origin  # Center COM too
+    com = all_dynamics['com'] - skeleton_origin  # Center COM using skeleton origin
     com_velocity = all_dynamics['com_velocity']
     linear_momentum = all_dynamics['linear_momentum']
     angular_momentum = all_dynamics['angular_momentum']
 
     print(f"[info] Playing continuous motion: {T} frames at {fps} fps ({T/fps:.1f} seconds)")
+
+    # Prepare markers if provided (apply same rotation as skeleton)
+    if markers_centered is not None:
+        markers_rotated = markers_centered.copy()
+        markers_rotated[..., 0] = markers_centered[..., 0]
+        markers_rotated[..., 1] = -markers_centered[..., 2]
+        markers_rotated[..., 2] = markers_centered[..., 1]
+        num_markers = markers.shape[1]
+        print(f"[info] Visualizing {num_markers} markers")
+    else:
+        markers_rotated = None
+        num_markers = 0
 
     for t in range(T):
         # Update skeleton joints
@@ -427,6 +480,13 @@ def play_continuous_motion_with_dynamics(vis, motion: np.ndarray, dynamics: Cent
             vis[f"skeleton/joints/{j}"].set_transform(
                 tf.translation_matrix(motion_centered[t, j].tolist())
             )
+
+        # Update markers
+        if markers_rotated is not None:
+            for m in range(num_markers):
+                vis[f"markers/{m}"].set_transform(
+                    tf.translation_matrix(markers_rotated[t, m].tolist())
+                )
 
         # Update skeleton edges
         for e_idx, (i, j) in enumerate(edges):
@@ -493,6 +553,7 @@ def main():
     root = Path(args.dataset_root)
     subjects = load_subjects(root / "infoData.npy")
     features = load_features(root / "time_sequences.h5")
+    labels = load_labels(root / "time_sequences.h5")  # Marker data
     by_subject = index_by_subject(subjects)
 
     if args.list:
@@ -509,6 +570,7 @@ def main():
     # Get sequences for this subject
     seq_indices = by_subject[args.subject]
     subject_features = features[seq_indices]
+    subject_labels = labels[seq_indices] if labels is not None else None
 
     # Extract height and weight
     height, weight = extract_height_weight_from_features(subject_features[0])
@@ -521,8 +583,30 @@ def main():
 
     print(f"[info] {N} sequences of {T} frames each, {K} joints")
 
-    # Reconstruct continuous motion
+    # Process markers if available
+    if subject_labels is not None:
+        # Markers are in labels, should be (N, T, M*3) where M is number of markers
+        N_lab, T_lab, F_lab = subject_labels.shape
+        if F_lab % 3 == 0:
+            num_markers = F_lab // 3
+            # Assume interleaved layout (x,y,z,x,y,z,...)
+            markers_xyz = subject_labels.reshape(N_lab, T_lab, num_markers, 3)
+            print(f"[info] {num_markers} markers loaded")
+        else:
+            print(f"[warn] Marker data has {F_lab} features (not divisible by 3), skipping")
+            markers_xyz = None
+    else:
+        markers_xyz = None
+        num_markers = 0
+
+    # Reconstruct continuous motion (skeleton)
     continuous_motion = reconstruct_continuous_motion(sequences, stride=args.stride)
+
+    # Reconstruct continuous markers if available
+    if markers_xyz is not None:
+        continuous_markers = reconstruct_continuous_motion(markers_xyz, stride=args.stride)
+    else:
+        continuous_markers = None
 
     # Rotate keypoints +90° around X axis to make Y point up instead of Z
     # Rotation: (x, y, z) -> (x, -z, y)
@@ -541,7 +625,8 @@ def main():
 
     # Setup visualization
     vis = meshcat.Visualizer().open()
-    setup_scene_with_dynamics(vis, args.radius, K)
+    marker_count = continuous_markers.shape[1] if continuous_markers is not None else 0
+    setup_scene_with_dynamics(vis, args.radius, K, num_markers=marker_count)
     edges = EDGES if K == 20 else [(i, i+1) for i in range(K-1)]
 
 
@@ -559,7 +644,8 @@ def main():
             play_continuous_motion_with_dynamics(
                 vis, continuous_motion, dynamics, args.fps, edges,
                 momentum_scale=args.momentum_scale,
-                angular_momentum_scale=args.angular_momentum_scale
+                angular_momentum_scale=args.angular_momentum_scale,
+                markers=continuous_markers
             )
             if not args.loop:
                 break
